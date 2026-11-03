@@ -131,7 +131,7 @@ Once the worker completes booting:
 2. **Tailscale ACL Recommendation**: Restrict access to `tag:winlab` so only authorized devices in your tailnet can communicate with ports `3389` and `8006`.
 3. **Codespaces Quotas**: GitHub Free accounts include 120 core-hours and 15 GB-month of storage per month. A 4-core machine utilizes 4 core-hours per wall-clock hour.
 4. **Session Limits**: A Codespace automatically suspends after an idle period (default 30–240 minutes) and has a maximum hard runtime limit of 12 hours.
-5. **Storage Location**: The guest VM disk is created in `/tmp/windows`. Files in `/tmp` are wiped upon codespace shutdown. Treat test lab instances as ephemeral.
+5. **Storage Location**: The guest VM disk lives in `<workspace>/.rdp-generator/windows` (persistent `/workspaces` storage), so Windows and its files survive Codespace stop/start and resume from the existing image. Data is lost only if the Codespace is deleted. The 32 GB disk counts toward your Codespaces storage quota (and the image is sparse, so real usage grows with use).
 
 ---
 
