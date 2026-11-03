@@ -18,7 +18,8 @@ WIN_VERSION="${WIN_VERSION:-2022}"
 WIN_RAM="${WIN_RAM:-8G}"
 WIN_CPUS="${WIN_CPUS:-2}"
 WIN_DISK="${WIN_DISK:-32G}"
-STORAGE_PATH="/tmp/windows"
+# Persistent storage inside the workspace (survives Codespace stop/start)
+STORAGE_PATH="${STORAGE_PATH:-$WORKSPACE_DIR/.rdp-generator/windows}"
 CREDS_FILE="$STATE_DIR/credentials"
 STATUS_FILE="$STATE_DIR/status.json"
 TS_STATE_DIR="$STATE_DIR/tailscale"
@@ -28,6 +29,12 @@ chmod 700 "$TS_STATE_DIR"
 chmod 600 "$CREDS_FILE" "$STATUS_FILE" "$LOG_FILE" 2>/dev/null || true
 sudo find "$TS_STATE_DIR" -type f -exec chmod 600 {} +
 sudo mkdir -p "$STORAGE_PATH" /var/run/tailscale
+
+# One-time migration from the old ephemeral location
+if [ -d /tmp/windows ] && [ -z "$(sudo ls -A "$STORAGE_PATH" 2>/dev/null)" ] && [ -n "$(sudo ls -A /tmp/windows 2>/dev/null)" ]; then
+    echo "Migrating existing Windows disk from /tmp/windows to $STORAGE_PATH..."
+    sudo cp -a /tmp/windows/. "$STORAGE_PATH"/
+fi
 
 RDP_MASTER_SECRET="${RDP_MASTER_SECRET:-}"
 TS_AUTHKEY="${TS_AUTHKEY:-}"
@@ -125,6 +132,13 @@ if [ -n "$TS_AUTHKEY" ]; then
 fi
 
 # Launch Windows Docker container bound to localhost
+if docker ps -a --format '{{.Names}}' | grep -q '^windows$'; then
+    CUR_SRC=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/storage"}}{{.Source}}{{end}}{{end}}' windows 2>/dev/null || true)
+    if [ "$CUR_SRC" != "$STORAGE_PATH" ]; then
+        echo "Container storage ($CUR_SRC) differs from $STORAGE_PATH; recreating container (disk data is kept)..."
+        docker rm -f windows || true
+    fi
+fi
 if ! docker ps -a --format '{{.Names}}' | grep -q '^windows$'; then
     echo "Spawning dockur/windows container..."
     docker run -d \
