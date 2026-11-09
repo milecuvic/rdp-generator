@@ -1,25 +1,19 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# RDP Generator Worker Bootstrapper (Non-root Devcontainer Compatible)
-# ==============================================================================
 set -euo pipefail
-
 umask 077
 WORKSPACE_DIR="${WORKSPACE_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
 STATE_DIR="$WORKSPACE_DIR/.rdp-generator"
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
-
 LOG_FILE="$STATE_DIR/worker.log"
 exec >> "$LOG_FILE" 2>&1
-echo "=== [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Starting RDP Generator Worker ==="
+echo "=== [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Starting RDP Worker ==="
 
 WIN_VERSION="${WIN_VERSION:-2022}"
 WIN_RAM="${WIN_RAM:-8G}"
 WIN_CPUS="${WIN_CPUS:-2}"
 WIN_DISK="${WIN_DISK:-32G}"
-# Persistent storage inside the workspace (survives Codespace stop/start)
-STORAGE_PATH="${STORAGE_PATH:-$WORKSPACE_DIR/.rdp-generator/windows}"
+STORAGE_PATH="/tmp/windows"
 CREDS_FILE="$STATE_DIR/credentials"
 STATUS_FILE="$STATE_DIR/status.json"
 TS_STATE_DIR="$STATE_DIR/tailscale"
@@ -30,16 +24,8 @@ chmod 600 "$CREDS_FILE" "$STATUS_FILE" "$LOG_FILE" 2>/dev/null || true
 sudo find "$TS_STATE_DIR" -type f -exec chmod 600 {} +
 sudo mkdir -p "$STORAGE_PATH" /var/run/tailscale
 
-# One-time migration from the old ephemeral location
-if [ -d /tmp/windows ] && [ -z "$(sudo ls -A "$STORAGE_PATH" 2>/dev/null)" ] && [ -n "$(sudo ls -A /tmp/windows 2>/dev/null)" ]; then
-    echo "Migrating existing Windows disk from /tmp/windows to $STORAGE_PATH..."
-    sudo cp -a /tmp/windows/. "$STORAGE_PATH"/
-fi
-
 RDP_MASTER_SECRET="${RDP_MASTER_SECRET:-}"
 TS_AUTHKEY="${TS_AUTHKEY:-}"
-
-# Load Codespace Secrets if not passed via env
 if [ -f "/workspaces/.codespaces/shared/user-secrets-envs.json" ]; then
     TS_AUTHKEY_SECRET=$(python3 -c "import json; print(json.load(open('/workspaces/.codespaces/shared/user-secrets-envs.json')).get('TS_AUTHKEY', ''))" 2>/dev/null || true)
     WIN_VERSION_SECRET=$(python3 -c "import json; print(json.load(open('/workspaces/.codespaces/shared/user-secrets-envs.json')).get('WIN_VERSION', ''))" 2>/dev/null || true)
@@ -69,7 +55,7 @@ if [ ! -f "$CREDS_FILE" ]; then
     WIN_PASS=""
     if [ -n "$RDP_MASTER_SECRET" ]; then
         if [ -z "${CODESPACE_NAME:-}" ]; then
-            echo "Error: CODESPACE_NAME is required to derive the deterministic password" >&2
+            echo "Error: CODESPACE_NAME missing with RDP_MASTER_SECRET" >&2
             exit 1
         fi
         export RDP_MASTER_SECRET CODESPACE_NAME
@@ -86,85 +72,46 @@ fi
 WIN_USER=$(sed -n 1p "$CREDS_FILE")
 WIN_PASS=$(sed -n 2p "$CREDS_FILE")
 
-echo "Configured User: $WIN_USER"
-
-# Remove broken yarn repo if present
 sudo rm -f /etc/apt/sources.list.d/yarn.list 2>/dev/null || true
 
-# Install Tailscale standalone binaries if not present
 if ! command -v tailscale >/dev/null 2>&1; then
-    echo "Installing Tailscale standalone binaries..."
     curl -fsSL https://pkgs.tailscale.com/stable/tailscale_1.76.6_amd64.tgz -o /tmp/ts.tgz
     tar -C /tmp -xzf /tmp/ts.tgz
     sudo cp /tmp/tailscale_*/tailscale* /usr/local/bin/
     rm -rf /tmp/ts.tgz /tmp/tailscale_*
 fi
 
-# Start tailscaled with state kept in the private workspace directory
 if ! pgrep -x tailscaled >/dev/null 2>&1; then
-    echo "Starting tailscaled..."
-    sudo nohup /usr/local/bin/tailscaled \
-        --state="$TS_STATE_DIR/tailscaled.state" \
-        --socket=/var/run/tailscale/tailscaled.sock \
-        > "$STATE_DIR/tailscaled.log" 2>&1 &
+    sudo nohup /usr/local/bin/tailscaled --state="$TS_STATE_DIR/tailscaled.state" --socket=/var/run/tailscale/tailscaled.sock > "$STATE_DIR/tailscaled.log" 2>&1 &
     sleep 3
 fi
 
-# Join Tailnet using a MagicDNS name the controller can recompute
 TS_IP=""
 TS_HOST=""
 if [ -n "$TS_AUTHKEY" ]; then
-    echo "Joining Tailscale mesh..."
     NODE_ID="${CODESPACE_NAME:-$(cat /etc/hostname | tr -dc 'a-zA-Z0-9')}"
     TS_HOST="winlab-${NODE_ID}"
     if [ ${#TS_HOST} -gt 63 ]; then
         TS_HOST="${TS_HOST:0:63}"
         while [[ "$TS_HOST" == *- ]]; do TS_HOST="${TS_HOST%-}"; done
     fi
-    sudo /usr/local/bin/tailscale up \
-        --auth-key="$TS_AUTHKEY" \
-        --hostname="$TS_HOST" \
-        --accept-dns=true \
-        --reset || true
-
+    sudo /usr/local/bin/tailscale up --auth-key="$TS_AUTHKEY" --hostname="$TS_HOST" --accept-dns=true --reset || true
     TS_IP=$(sudo /usr/local/bin/tailscale ip -4 || true)
-    echo "Tailscale connected: host = $TS_HOST ip = $TS_IP"
 fi
 
-# Launch Windows Docker container bound to localhost
-if docker ps -a --format '{{.Names}}' | grep -q '^windows$'; then
-    CUR_SRC=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/storage"}}{{.Source}}{{end}}{{end}}' windows 2>/dev/null || true)
-    if [ "$CUR_SRC" != "$STORAGE_PATH" ]; then
-        echo "Container storage ($CUR_SRC) differs from $STORAGE_PATH; recreating container (disk data is kept)..."
-        docker rm -f windows || true
-    fi
-fi
 if ! docker ps -a --format '{{.Names}}' | grep -q '^windows$'; then
-    echo "Spawning dockur/windows container..."
-    docker run -d \
-        --name windows \
+    docker run -d --name windows \
         --restart unless-stopped \
-        --device=/dev/kvm \
-        --device=/dev/net/tun \
-        --cap-add NET_ADMIN \
-        -e VERSION="$WIN_VERSION" \
-        -e RAM_SIZE="$WIN_RAM" \
-        -e CPU_CORES="$WIN_CPUS" \
-        -e DISK_SIZE="$WIN_DISK" \
-        -e USERNAME="$WIN_USER" \
-        -e PASSWORD="$WIN_PASS" \
-        -p 127.0.0.1:8006:8006 \
-        -p 127.0.0.1:3389:3389/tcp \
-        -v "$STORAGE_PATH:/storage" \
-        --stop-timeout 120 \
-        ghcr.io/dockur/windows
+        --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN \
+        -e VERSION="$WIN_VERSION" -e RAM_SIZE="$WIN_RAM" -e CPU_CORES="$WIN_CPUS" -e DISK_SIZE="$WIN_DISK" \
+        -e USERNAME="$WIN_USER" -e PASSWORD="$WIN_PASS" \
+        -p 127.0.0.1:8006:8006 -p 127.0.0.1:3389:3389/tcp \
+        -v "$STORAGE_PATH:/storage" --stop-timeout 120 ghcr.io/dockur/windows
 else
     docker start windows || true
 fi
 
-# Setup lightweight background relay so Tailscale IP can access localhost Windows
 if [ -n "$TS_IP" ]; then
-    echo "Starting Tailscale ingress relay for 3389 and 8006..."
     sudo pkill -f "start_server.*$TS_IP" 2>/dev/null || true
     sudo nohup python3 -c "
 import socket, threading
@@ -204,7 +151,6 @@ start_server('$TS_IP', 8006, '127.0.0.1', 8006)
 " > "$STATE_DIR/pyrelay.log" 2>&1 &
 fi
 
-# Record status
 export STATE_DIR WIN_VERSION WIN_RAM WIN_CPUS WIN_DISK WIN_USER WIN_PASS TS_IP TS_HOST
 python3 - <<'PY'
 import datetime, json, os
@@ -227,5 +173,3 @@ for name, data in (('config.json', config), ('status.json', status)):
         json.dump(data, f)
     os.chmod(path, 0o600)
 PY
-
-echo "=== RDP Generator Worker initialized successfully ==="
